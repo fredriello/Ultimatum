@@ -1,0 +1,270 @@
+name: "Build"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to build'
+        required: true
+        type: string
+      target_os:
+        description: 'Target OS (android, linux, windows, mac)'
+        required: true
+        type: string
+      build_type:
+        description: 'Build type (Release, Debug)'
+        required: true
+        type: string
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag or branch to build'
+        required: true
+        type: string
+      target_os:
+        description: 'Target OS'
+        required: true
+        type: choice
+        options:
+          - android
+          - linux
+          - windows
+          - mac
+        default: 'linux'
+      build_type:
+        description: 'Build type'
+        required: true
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: 'Release'
+
+jobs:
+  build:
+    name: "Compile (${{ inputs.target_os }}-${{ inputs.build_type }})"
+    runs-on: ${{ inputs.target_os == 'mac' && 'macos-latest' || inputs.target_os == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 480
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      # --- Disk space cleanup ---
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune -af 2>/dev/null || true
+          sudo apt-get clean
+          echo "=== Disk after cleanup ==="
+          df -h /
+
+      # --- System dependencies ---
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang lld ninja-build \
+            python3 python3-pip git curl wget \
+            pkg-config libglib2.0-dev libgtk-3-dev \
+            libdrm-dev libnss3-dev libatk1.0-dev \
+            libatk-bridge2.0-dev libcups2-dev \
+            libxkbcommon-dev libxcomposite-dev \
+            libxdamage-dev libxrandr-dev libgbm-dev \
+            libpango1.0-dev libasound2-dev \
+            libdbus-1-dev libxss-dev libxtst-dev
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja python3
+
+      # --- Setup ccache (composite action) ---
+      - name: Setup ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          target_os: ${{ inputs.target_os }}
+          build_type: ${{ inputs.build_type }}
+          version: ${{ inputs.version }}
+
+      # --- Restore depot_tools ---
+      - name: Restore depot_tools cache
+        uses: actions/cache@v4
+        with:
+          path: depot_tools
+          key: depot-tools-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            depot-tools-${{ runner.os }}-
+
+      - name: Ensure depot_tools exists
+        run: |
+          if [ ! -d "depot_tools" ]; then
+            git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git depot_tools
+          fi
+          echo "${{ github.workspace }}/depot_tools" >> $GITHUB_PATH
+
+      # --- Restore source ---
+      - name: Restore source cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            src
+            .gclient
+            .gclient_entries
+          key: src-${{ inputs.target_os }}-${{ inputs.version }}
+          restore-keys: |
+            src-${{ inputs.target_os }}-
+
+      - name: Verify source exists
+        run: |
+          if [ ! -d "src" ]; then
+            echo "::error::Source not found in cache. Run source-sync workflow first."
+            exit 1
+          fi
+          echo "Source directory found."
+          du -sh src/
+
+      # --- Restore incremental build objects ---
+      - name: Restore build object cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/out/${{ inputs.build_type }}/obj
+            src/out/${{ inputs.build_type }}/gen
+            src/out/${{ inputs.build_type }}/.ninja_deps
+            src/out/${{ inputs.build_type }}/.ninja_log
+            src/out/${{ inputs.build_type }}/args.gn
+          key: build-obj-${{ inputs.target_os }}-${{ inputs.build_type }}-${{ inputs.version }}-${{ github.run_id }}
+          restore-keys: |
+            build-obj-${{ inputs.target_os }}-${{ inputs.build_type }}-${{ inputs.version }}-
+            build-obj-${{ inputs.target_os }}-${{ inputs.build_type }}-
+
+      # --- GN generate ---
+      - name: Generate build files (Android)
+        if: inputs.target_os == 'android'
+        working-directory: src
+        run: |
+          gn gen out/${{ inputs.build_type }} --args='
+            target_os="android"
+            target_cpu="arm64"
+            is_debug=${{ inputs.build_type == 'Debug' && 'true' || 'false' }}
+            is_official_build=${{ inputs.build_type == 'Release' && 'true' || 'false' }}
+            is_component_build=false
+            symbol_level=0
+            blink_symbol_level=0
+            enable_nacl=false
+            cc_wrapper="ccache"
+            use_lld=true
+            use_thin_lto=false
+          '
+
+      - name: Generate build files (Linux)
+        if: inputs.target_os == 'linux'
+        working-directory: src
+        run: |
+          gn gen out/${{ inputs.build_type }} --args='
+            target_os="linux"
+            target_cpu="x64"
+            is_debug=${{ inputs.build_type == 'Debug' && 'true' || 'false' }}
+            is_official_build=${{ inputs.build_type == 'Release' && 'true' || 'false' }}
+            is_component_build=false
+            symbol_level=0
+            enable_nacl=false
+            cc_wrapper="ccache"
+            use_lld=true
+            use_thin_lto=false
+          '
+
+      - name: Generate build files (Windows)
+        if: inputs.target_os == 'windows'
+        working-directory: src
+        run: |
+          gn gen out/${{ inputs.build_type }} --args='
+            target_os="win"
+            target_cpu="x64"
+            is_debug=${{ inputs.build_type == 'Debug' && 'true' || 'false' }}
+            is_official_build=${{ inputs.build_type == 'Release' && 'true' || 'false' }}
+            is_component_build=false
+            symbol_level=0
+            enable_nacl=false
+            cc_wrapper="ccache"
+            use_lld=true
+          '
+
+      - name: Generate build files (macOS)
+        if: inputs.target_os == 'mac'
+        working-directory: src
+        run: |
+          gn gen out/${{ inputs.build_type }} --args='
+            target_os="mac"
+            target_cpu="x64"
+            is_debug=${{ inputs.build_type == 'Debug' && 'true' || 'false' }}
+            is_official_build=${{ inputs.build_type == 'Release' && 'true' || 'false' }}
+            is_component_build=false
+            symbol_level=0
+            enable_nacl=false
+            cc_wrapper="ccache"
+            use_lld=true
+          '
+
+      # --- Compile ---
+      - name: Build target
+        working-directory: src
+        run: |
+          TARGET=""
+          case "${{ inputs.target_os }}" in
+            android) TARGET="chrome_public_apk" ;;
+            *)       TARGET="chrome" ;;
+          esac
+          echo "Building target: $TARGET"
+          autoninja -C out/${{ inputs.build_type }} $TARGET
+
+      # --- Post-build stats ---
+      - name: ccache stats (post-build)
+        if: always()
+        run: |
+          echo "=== ccache stats (after build) ==="
+          ccache -s
+          echo "=== Cache directory size ==="
+          du -sh ~/.ccache 2>/dev/null || true
+
+      - name: Disk usage report
+        if: always()
+        run: |
+          echo "=== Disk usage after build ==="
+          df -h /
+          echo "=== Build output size ==="
+          du -sh src/out/${{ inputs.build_type }}/ 2>/dev/null || true
+
+      # --- Upload build output for packaging stage ---
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output-${{ inputs.target_os }}-${{ inputs.version }}
+          path: |
+            src/out/${{ inputs.build_type }}/chrome
+            src/out/${{ inputs.build_type }}/chrome.exe
+            src/out/${{ inputs.build_type }}/chrome_sandbox
+            src/out/${{ inputs.build_type }}/chrome_crashpad_handler
+            src/out/${{ inputs.build_type }}/*.so
+            src/out/${{ inputs.build_type }}/*.dll
+            src/out/${{ inputs.build_type }}/*.pak
+            src/out/${{ inputs.build_type }}/*.bin
+            src/out/${{ inputs.build_type }}/*.dat
+            src/out/${{ inputs.build_type }}/locales/
+            src/out/${{ inputs.build_type }}/MEIPreload/
+            src/out/${{ inputs.build_type }}/apks/
+            src/out/${{ inputs.build_type }}/Chromium.app/
+          retention-days: 1
+          compression-level: 6

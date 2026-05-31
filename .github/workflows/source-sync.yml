@@ -1,0 +1,137 @@
+name: "Source Sync"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version tag or branch to sync'
+        required: true
+        type: string
+      target_os:
+        description: 'Target OS for gclient sync'
+        required: true
+        type: string
+    outputs:
+      src-cache-key:
+        description: 'Cache key for restored/saved source'
+        value: ${{ jobs.sync.outputs.src-cache-key }}
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag or branch to sync (e.g. 130.0.6723.116 or main)'
+        required: true
+        type: string
+      target_os:
+        description: 'Target OS for gclient sync'
+        required: true
+        type: choice
+        options:
+          - android
+          - linux
+          - windows
+          - mac
+        default: 'android'
+
+jobs:
+  sync:
+    name: "Fetch & Sync Source"
+    runs-on: ${{ inputs.target_os == 'mac' && 'macos-latest' || inputs.target_os == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 180
+    outputs:
+      src-cache-key: ${{ steps.cache-keys.outputs.src-key }}
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Generate cache keys
+        id: cache-keys
+        run: |
+          echo "src-key=src-${{ inputs.target_os }}-${{ inputs.version }}" >> $GITHUB_OUTPUT
+          echo "depot-key=depot-tools-${{ runner.os }}" >> $GITHUB_OUTPUT
+
+      # --- depot_tools ---
+      - name: Restore depot_tools cache
+        id: depot-cache
+        uses: actions/cache@v4
+        with:
+          path: depot_tools
+          key: ${{ steps.cache-keys.outputs.depot-key }}-${{ github.sha }}
+          restore-keys: |
+            ${{ steps.cache-keys.outputs.depot-key }}-
+
+      - name: Clone depot_tools
+        if: steps.depot-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git depot_tools
+
+      - name: Update depot_tools
+        if: steps.depot-cache.outputs.cache-hit == 'true'
+        run: |
+          cd depot_tools && git pull --ff-only 2>/dev/null || true
+
+      - name: Add depot_tools to PATH
+        run: echo "${{ github.workspace }}/depot_tools" >> $GITHUB_PATH
+
+      # --- Source code ---
+      - name: Restore source cache
+        id: src-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            src
+            .gclient
+            .gclient_entries
+          key: ${{ steps.cache-keys.outputs.src-key }}
+          restore-keys: |
+            src-${{ inputs.target_os }}-
+
+      - name: Clone Ultimatum source
+        if: steps.src-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf src
+          git clone --depth 1 --branch ${{ inputs.version }} \
+            https://github.com/gonzazoid/Ultimatum.git src 2>/dev/null || \
+          git clone --depth 1 https://github.com/gonzazoid/Ultimatum.git src
+          cd src
+          git fetch --depth 1 origin tag ${{ inputs.version }} 2>/dev/null || true
+          git checkout ${{ inputs.version }} 2>/dev/null || echo "Already on correct version"
+
+      - name: Generate .gclient
+        if: steps.src-cache.outputs.cache-hit != 'true'
+        run: |
+          TARGET_OS="${{ inputs.target_os }}"
+          if [ "$TARGET_OS" = "windows" ]; then TARGET_OS="win"; fi
+
+          cat > .gclient << EOF
+          solutions = [
+            {
+              "name": "src",
+              "url": "https://github.com/gonzazoid/Ultimatum.git@${{ inputs.version }}",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_deps": {},
+            },
+          ]
+          target_os = ["${TARGET_OS}"]
+          EOF
+
+      - name: Run gclient sync
+        if: steps.src-cache.outputs.cache-hit != 'true'
+        run: |
+          export PATH="${{ github.workspace }}/depot_tools:$PATH"
+          gclient sync --no-history --shallow --nohooks --no-bootstrap
+          gclient runhooks
+
+      - name: Verify and report
+        run: |
+          echo "=== Source checkout info ==="
+          echo "Version: ${{ inputs.version }}"
+          echo "Target OS: ${{ inputs.target_os }}"
+          echo "Cache key: ${{ steps.cache-keys.outputs.src-key }}"
+          echo "Cache hit: ${{ steps.src-cache.outputs.cache-hit }}"
+          echo "=== Source size ==="
+          du -sh src/ 2>/dev/null || echo "src/ not present"
+          echo "=== Top-level files ==="
+          ls src/ 2>/dev/null | head -20 || echo "Cannot list src/"

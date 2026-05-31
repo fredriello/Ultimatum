@@ -1,0 +1,78 @@
+name: 'Setup ccache'
+description: 'Install and configure ccache with GitHub Actions cache for Chromium builds'
+
+inputs:
+  target_os:
+    description: 'Target OS (android, linux, windows, mac)'
+    required: true
+  build_type:
+    description: 'Build type (Release, Debug)'
+    required: true
+  version:
+    description: 'Version being built (for cache key)'
+    required: true
+  max_size:
+    description: 'Maximum ccache size'
+    required: false
+    default: '30G'
+
+outputs:
+  cache-hit:
+    description: 'Whether the ccache was restored from cache'
+    value: ${{ steps.ccache-restore.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install ccache (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y ccache
+
+    - name: Install ccache (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install ccache
+
+    - name: Install ccache (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        choco install ccache -y
+
+    - name: Restore ccache
+      id: ccache-restore
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ccache-${{ inputs.target_os }}-${{ inputs.build_type }}-${{ inputs.version }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ inputs.target_os }}-${{ inputs.build_type }}-${{ inputs.version }}-
+          ccache-${{ inputs.target_os }}-${{ inputs.build_type }}-
+          ccache-${{ inputs.target_os }}-
+
+    - name: Configure ccache
+      shell: bash
+      run: |
+        mkdir -p ~/.ccache
+        ccache --set-config=cache_dir=~/.ccache
+        ccache --set-config=max_size=${{ inputs.max_size }}
+        ccache --set-config=compression=true
+        ccache --set-config=compression_level=6
+        ccache --set-config=sloppiness=time_macros,include_file_mtime,include_file_ctime
+        ccache --set-config=depend_mode=true
+        ccache --set-config=file_clone=true
+        ccache --set-config=inode_cache=true
+        ccache --set-config=hash_dir=false
+        ccache -z
+        echo "=== ccache config ==="
+        ccache -p
+
+    - name: Report ccache stats (pre-build)
+      shell: bash
+      run: |
+        echo "=== ccache stats (before build) ==="
+        ccache -s

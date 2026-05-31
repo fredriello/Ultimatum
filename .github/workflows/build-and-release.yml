@@ -1,4 +1,7 @@
-name: Build and Release
+name: "Build and Release"
+
+# Orchestrator workflow: calls reusable workflows in sequence
+# source-sync → build → package → release
 
 on:
   workflow_dispatch:
@@ -25,226 +28,74 @@ on:
           - Release
           - Debug
         default: 'Release'
+      skip_sync:
+        description: 'Skip source sync (use cached source from previous run)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
-env:
-  DEPOT_TOOLS_PATH: ${{ github.workspace }}/depot_tools
-
 jobs:
+  # ============================================================
+  # Stage 1: Fetch and sync source code + dependencies
+  # ============================================================
+  source-sync:
+    name: "1/4 Source Sync"
+    if: ${{ inputs.skip_sync != true }}
+    uses: ./.github/workflows/source-sync.yml
+    with:
+      version: ${{ inputs.version }}
+      target_os: ${{ inputs.target_os }}
+
+  # ============================================================
+  # Stage 2: Compile with ccache acceleration
+  # ============================================================
   build:
-    runs-on: ${{ inputs.target_os == 'mac' && 'macos-latest' || inputs.target_os == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
-    timeout-minutes: 600
+    name: "2/4 Build"
+    needs: [source-sync]
+    if: ${{ always() && (needs.source-sync.result == 'success' || needs.source-sync.result == 'skipped') }}
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ inputs.version }}
+      target_os: ${{ inputs.target_os }}
+      build_type: ${{ inputs.build_type }}
 
-    steps:
-      - name: Free disk space (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache
-          sudo apt-get clean
-          df -h
+  # ============================================================
+  # Stage 3: Package build artifacts
+  # ============================================================
+  package:
+    name: "3/4 Package"
+    needs: [build]
+    uses: ./.github/workflows/package.yml
+    with:
+      version: ${{ inputs.version }}
+      target_os: ${{ inputs.target_os }}
+      build_type: ${{ inputs.build_type }}
 
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            lld \
-            ninja-build \
-            python3 \
-            python3-pip \
-            git \
-            curl \
-            wget \
-            pkg-config \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libdrm-dev \
-            libnss3-dev \
-            libatk1.0-dev \
-            libatk-bridge2.0-dev \
-            libcups2-dev \
-            libxkbcommon-dev \
-            libxcomposite-dev \
-            libxdamage-dev \
-            libxrandr-dev \
-            libgbm-dev \
-            libpango1.0-dev \
-            libasound2-dev
-
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install ninja python3
-
-      - name: Setup depot_tools
-        run: |
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git ${{ env.DEPOT_TOOLS_PATH }}
-          echo "${{ env.DEPOT_TOOLS_PATH }}" >> $GITHUB_PATH
-
-      - name: Checkout Ultimatum source
-        run: |
-          mkdir -p src
-          git clone --depth 1 --branch ${{ inputs.version }} https://github.com/gonzazoid/Ultimatum.git src || \
-          git clone --depth 1 https://github.com/gonzazoid/Ultimatum.git src
-
-      - name: Checkout specific version (if tag)
-        working-directory: src
-        run: |
-          git fetch --tags
-          git checkout ${{ inputs.version }} || echo "Already on the correct version"
-
-      - name: Run gclient sync
-        run: |
-          cat > .gclient << 'EOF'
-          solutions = [
-            {
-              "name": "src",
-              "url": "https://github.com/gonzazoid/Ultimatum.git@${{ inputs.version }}",
-              "deps_file": "DEPS",
-              "managed": False,
-              "custom_deps": {},
-            },
-          ]
-          target_os = ["${{ inputs.target_os }}"]
-          EOF
-          gclient sync --no-history --shallow
-
-      - name: Generate build files (Android)
-        if: inputs.target_os == 'android'
-        working-directory: src
-        run: |
-          gn gen out/${{ inputs.build_type }} --args='
-            target_os="android"
-            target_cpu="arm64"
-            is_debug=${{ inputs.build_type == 'Debug' && 'true' || 'false' }}
-            is_official_build=${{ inputs.build_type == 'Release' && 'true' || 'false' }}
-            is_component_build=false
-            symbol_level=0
-            enable_nacl=false
-            blink_symbol_level=0
-          '
-
-      - name: Generate build files (Linux)
-        if: inputs.target_os == 'linux'
-        working-directory: src
-        run: |
-          gn gen out/${{ inputs.build_type }} --args='
-            target_os="linux"
-            target_cpu="x64"
-            is_debug=${{ inputs.build_type == 'Debug' && 'true' || 'false' }}
-            is_official_build=${{ inputs.build_type == 'Release' && 'true' || 'false' }}
-            is_component_build=false
-            symbol_level=0
-            enable_nacl=false
-          '
-
-      - name: Generate build files (Windows)
-        if: inputs.target_os == 'windows'
-        working-directory: src
-        run: |
-          gn gen out/${{ inputs.build_type }} --args='
-            target_os="win"
-            target_cpu="x64"
-            is_debug=${{ inputs.build_type == 'Debug' && 'true' || 'false' }}
-            is_official_build=${{ inputs.build_type == 'Release' && 'true' || 'false' }}
-            is_component_build=false
-            symbol_level=0
-            enable_nacl=false
-          '
-
-      - name: Generate build files (macOS)
-        if: inputs.target_os == 'mac'
-        working-directory: src
-        run: |
-          gn gen out/${{ inputs.build_type }} --args='
-            target_os="mac"
-            target_cpu="x64"
-            is_debug=${{ inputs.build_type == 'Debug' && 'true' || 'false' }}
-            is_official_build=${{ inputs.build_type == 'Release' && 'true' || 'false' }}
-            is_component_build=false
-            symbol_level=0
-            enable_nacl=false
-          '
-
-      - name: Build (Android)
-        if: inputs.target_os == 'android'
-        working-directory: src
-        run: |
-          autoninja -C out/${{ inputs.build_type }} chrome_public_apk
-
-      - name: Build (Linux)
-        if: inputs.target_os == 'linux'
-        working-directory: src
-        run: |
-          autoninja -C out/${{ inputs.build_type }} chrome
-
-      - name: Build (Windows)
-        if: inputs.target_os == 'windows'
-        working-directory: src
-        run: |
-          autoninja -C out/${{ inputs.build_type }} chrome
-
-      - name: Build (macOS)
-        if: inputs.target_os == 'mac'
-        working-directory: src
-        run: |
-          autoninja -C out/${{ inputs.build_type }} chrome
-
-      - name: Package artifacts (Android)
-        if: inputs.target_os == 'android'
-        run: |
-          mkdir -p artifacts
-          cp src/out/${{ inputs.build_type }}/apks/ChromePublic.apk artifacts/Ultimatum-${{ inputs.version }}-android-arm64.apk || true
-          find src/out/${{ inputs.build_type }} -name "*.apk" -exec cp {} artifacts/ \; || true
-
-      - name: Package artifacts (Linux)
-        if: inputs.target_os == 'linux'
-        run: |
-          mkdir -p artifacts
-          tar -czf artifacts/Ultimatum-${{ inputs.version }}-linux-x64.tar.gz \
-            -C src/out/${{ inputs.build_type }} chrome chrome_sandbox *.so *.pak locales icudtl.dat || \
-          tar -czf artifacts/Ultimatum-${{ inputs.version }}-linux-x64.tar.gz \
-            -C src/out/${{ inputs.build_type }} chrome
-
-      - name: Package artifacts (Windows)
-        if: inputs.target_os == 'windows'
-        run: |
-          mkdir -p artifacts
-          7z a artifacts/Ultimatum-${{ inputs.version }}-windows-x64.zip src/out/${{ inputs.build_type }}/chrome.exe src/out/${{ inputs.build_type }}/*.dll src/out/${{ inputs.build_type }}/*.pak src/out/${{ inputs.build_type }}/locales
-
-      - name: Package artifacts (macOS)
-        if: inputs.target_os == 'mac'
-        run: |
-          mkdir -p artifacts
-          tar -czf artifacts/Ultimatum-${{ inputs.version }}-mac-x64.tar.gz \
-            -C src/out/${{ inputs.build_type }} Chromium.app || \
-          tar -czf artifacts/Ultimatum-${{ inputs.version }}-mac-x64.tar.gz \
-            -C src/out/${{ inputs.build_type }} chrome
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ultimatum-${{ inputs.target_os }}-${{ inputs.version }}
-          path: artifacts/
-
+  # ============================================================
+  # Stage 4: Create GitHub Release
+  # ============================================================
   release:
-    needs: build
+    name: "4/4 Release"
+    needs: [package]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - name: Download artifacts
+      - name: Download packaged artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ultimatum-${{ inputs.target_os }}-${{ inputs.version }}
+          name: ultimatum-packaged-${{ inputs.target_os }}-${{ inputs.version }}
           path: artifacts/
 
-      - name: Create or update GitHub Release
+      - name: List release files
+        run: |
+          echo "=== Files to release ==="
+          ls -lh artifacts/
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.version }}-${{ inputs.target_os }}
@@ -252,13 +103,21 @@ jobs:
           body: |
             ## Ultimatum ${{ inputs.version }}
 
-            **Target OS:** ${{ inputs.target_os }}
-            **Build Type:** ${{ inputs.build_type }}
-            **Source:** [gonzazoid/Ultimatum@${{ inputs.version }}](https://github.com/gonzazoid/Ultimatum/tree/${{ inputs.version }})
+            | Field | Value |
+            |-------|-------|
+            | **Target OS** | ${{ inputs.target_os }} |
+            | **Build Type** | ${{ inputs.build_type }} |
+            | **Source** | [gonzazoid/Ultimatum@${{ inputs.version }}](https://github.com/gonzazoid/Ultimatum/tree/${{ inputs.version }}) |
+            | **Workflow** | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
 
-            ### Build Info
-            - Built from upstream gonzazoid/Ultimatum
-            - Version/Branch: `${{ inputs.version }}`
+            ### Build Acceleration
+            - **ccache** enabled for compilation caching
+            - **Incremental build** with object file caching
+            - **depot_tools** cached across runs
+            - **Source code** cached for repeat builds
+
+            ### Verification
+            SHA256 checksums are included alongside each artifact.
           files: artifacts/*
           draft: false
           prerelease: false

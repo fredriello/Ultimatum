@@ -1,0 +1,182 @@
+name: "Package"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version string for naming'
+        required: true
+        type: string
+      target_os:
+        description: 'Target OS (android, linux, windows, mac)'
+        required: true
+        type: string
+      build_type:
+        description: 'Build type (Release, Debug)'
+        required: true
+        type: string
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string'
+        required: true
+        type: string
+      target_os:
+        description: 'Target OS'
+        required: true
+        type: choice
+        options:
+          - android
+          - linux
+          - windows
+          - mac
+        default: 'linux'
+      build_type:
+        description: 'Build type'
+        required: true
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: 'Release'
+
+jobs:
+  package:
+    name: "Package (${{ inputs.target_os }})"
+    runs-on: ${{ inputs.target_os == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Download build output
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output-${{ inputs.target_os }}-${{ inputs.version }}
+          path: build-output/
+
+      - name: List downloaded files
+        run: |
+          echo "=== Downloaded build output ==="
+          find build-output/ -type f | head -50
+          echo "=== Total size ==="
+          du -sh build-output/
+
+      # --- Android packaging ---
+      - name: Package (Android)
+        if: inputs.target_os == 'android'
+        run: |
+          mkdir -p artifacts
+          # Find and copy APK files
+          find build-output/ -name "*.apk" | while read apk; do
+            filename=$(basename "$apk" .apk)
+            cp "$apk" "artifacts/Ultimatum-${{ inputs.version }}-android-arm64-${filename}.apk"
+          done
+          # If specific ChromePublic.apk path
+          if [ -f "build-output/apks/ChromePublic.apk" ]; then
+            cp "build-output/apks/ChromePublic.apk" \
+              "artifacts/Ultimatum-${{ inputs.version }}-android-arm64.apk"
+          fi
+
+      # --- Linux packaging ---
+      - name: Package (Linux)
+        if: inputs.target_os == 'linux'
+        run: |
+          mkdir -p artifacts package-staging/ultimatum
+
+          # Collect browser files
+          for item in chrome chrome_sandbox chrome_crashpad_handler \
+                      icudtl.dat v8_context_snapshot.bin; do
+            find build-output/ -name "$item" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+          done
+
+          # Shared libraries
+          find build-output/ -name "*.so" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+
+          # Resource paks
+          find build-output/ -name "*.pak" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+
+          # Locales directory
+          if [ -d "build-output/locales" ]; then
+            cp -r build-output/locales package-staging/ultimatum/
+          else
+            find build-output/ -type d -name "locales" -exec cp -r {} package-staging/ultimatum/ \; 2>/dev/null
+          fi
+
+          # MEIPreload
+          find build-output/ -type d -name "MEIPreload" -exec cp -r {} package-staging/ultimatum/ \; 2>/dev/null
+
+          # Create tarball
+          tar -czf "artifacts/Ultimatum-${{ inputs.version }}-linux-x64.tar.gz" \
+            -C package-staging ultimatum
+
+          # Generate checksum
+          cd artifacts
+          sha256sum "Ultimatum-${{ inputs.version }}-linux-x64.tar.gz" > \
+            "Ultimatum-${{ inputs.version }}-linux-x64.tar.gz.sha256"
+
+      # --- Windows packaging ---
+      - name: Package (Windows)
+        if: inputs.target_os == 'windows'
+        shell: bash
+        run: |
+          mkdir -p artifacts package-staging/ultimatum
+
+          # Collect browser files
+          find build-output/ -name "chrome.exe" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+          find build-output/ -name "*.dll" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+          find build-output/ -name "*.pak" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+          find build-output/ -name "icudtl.dat" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+          find build-output/ -name "v8_context_snapshot.bin" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+
+          # Locales
+          find build-output/ -type d -name "locales" -exec cp -r {} package-staging/ultimatum/ \; 2>/dev/null
+
+          # Create zip
+          cd package-staging
+          7z a "../artifacts/Ultimatum-${{ inputs.version }}-windows-x64.zip" ultimatum/
+
+          # Generate checksum
+          cd ../artifacts
+          sha256sum "Ultimatum-${{ inputs.version }}-windows-x64.zip" > \
+            "Ultimatum-${{ inputs.version }}-windows-x64.zip.sha256"
+
+      # --- macOS packaging ---
+      - name: Package (macOS)
+        if: inputs.target_os == 'mac'
+        run: |
+          mkdir -p artifacts
+
+          # Check for .app bundle
+          APP_DIR=$(find build-output/ -type d -name "Chromium.app" | head -1)
+          if [ -n "$APP_DIR" ]; then
+            tar -czf "artifacts/Ultimatum-${{ inputs.version }}-mac-x64.tar.gz" \
+              -C "$(dirname "$APP_DIR")" "Chromium.app"
+          else
+            # Fallback: package individual files
+            mkdir -p package-staging/ultimatum
+            find build-output/ -name "chrome" -type f -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+            find build-output/ -name "*.pak" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+            find build-output/ -name "icudtl.dat" -exec cp {} package-staging/ultimatum/ \; 2>/dev/null
+            find build-output/ -type d -name "locales" -exec cp -r {} package-staging/ultimatum/ \; 2>/dev/null
+
+            tar -czf "artifacts/Ultimatum-${{ inputs.version }}-mac-x64.tar.gz" \
+              -C package-staging ultimatum
+          fi
+
+          # Generate checksum
+          cd artifacts
+          sha256sum "Ultimatum-${{ inputs.version }}-mac-x64.tar.gz" > \
+            "Ultimatum-${{ inputs.version }}-mac-x64.tar.gz.sha256"
+
+      # --- Report ---
+      - name: List artifacts
+        run: |
+          echo "=== Final packaged artifacts ==="
+          ls -lh artifacts/
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ultimatum-packaged-${{ inputs.target_os }}-${{ inputs.version }}
+          path: artifacts/
+          retention-days: 7
